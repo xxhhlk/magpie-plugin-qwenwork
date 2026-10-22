@@ -1083,7 +1083,12 @@ async function* events(body, onByte, cancelled) {
     yield { error: { status: 502, message: why } }
     return
   }
-  if (!meaningful) {
+  // Nothing reached the caller and the upstream gave no terminator at all: the
+  // request produced no answer. A reply the upstream *did* finish -- [DONE] or
+  // a finish_reason -- is complete even when empty: max_tokens cut short of the
+  // first content token yields a legitimate zero-content `length`, which must
+  // not be reported as a failure.
+  if (!meaningful && !done && !fr) {
     yield { error: { status: 502, message: "upstream ended without an answer" } }
     return
   }

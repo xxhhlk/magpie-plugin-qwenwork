@@ -247,6 +247,21 @@ try {
   assert.equal(empty.status, 502, 'an empty upstream is a 502, not a 200 with no content')
   checks.push('An upstream that ends without an answer is a 502')
 
+  // A reply the upstream finished but left empty -- max_tokens cut off before
+  // the first content token, which a reasoning model does readily -- is a valid
+  // zero-content completion, not a failure: it carries a finish_reason and
+  // [DONE], so it must reach the caller as a 200.
+  agentReplies.push([
+    sse({ role: 'assistant', content: '' }),
+    sse({}, 'length'),
+    'data: {"body":"[DONE]"}\n\n',
+  ].join(''))
+  const truncatedBudget = await loader.fetch(values.API + '/chat/completions', { body: JSON.stringify(chat()) })
+  assert.equal(truncatedBudget.status, 200, 'a finished-but-empty reply is a 200')
+  const tbBody = await truncatedBudget.json()
+  assert.equal(tbBody.choices[0].finish_reason, 'length', 'the length finish survives')
+  checks.push('A finished empty reply is a 200, not a spurious 502')
+
   // Two tool calls interleaved (0, 1, 0, 1): each keeps its own slot, so the
   // second fragment of 0 lands on 0 and no call is opened twice.
   agentReplies.push([
