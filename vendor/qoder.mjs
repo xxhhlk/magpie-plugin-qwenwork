@@ -53,6 +53,13 @@ const RENEW_LEAD = 10 * 60 * 1000 // and this close, magpie renews it ahead of t
 const KEEP_SPENT_MS = 60 * 60 * 1000 // how long what a spent refresh token gave is remembered
 const DAY = 24 * 60 * 60 * 1000
 const CHAT = "@ai-sdk/openai-compatible"
+// A stream is bounded by silence, not by total time: a reasoning turn can run
+// for minutes while still producing bytes, and a total-time cap would cut it
+// mid-reply (the client sees the answer simply stop). 90s with no byte at all
+// is a stuck upstream. The hard limit is only a backstop against a peer that
+// keeps dribbling forever.
+const STREAM_IDLE_MS = 90 * 1000
+const STREAM_HARD_MS = 30 * 60 * 1000
 
 // Qoder's embedded 1024-bit RSA key (from the client's cosy source): it wraps
 // the per-request AES key of the COSY Authorization header.
@@ -195,6 +202,45 @@ function deviceExpiry(dt) {
   if (!isNaN(at)) return at
   if (dt?.expires_in > 0) return Date.now() + dt.expires_in * 1000
   return Date.now() + DAY
+}
+
+// streamGuard bounds a chat stream by silence rather than by total time.
+// `bump` is called on every byte read from the upstream, so a slow but live
+// reply is never cut; only a stretch with nothing at all aborts. The returned
+// signal also relays the caller's own cancellation, and `done` clears the
+// timers so a finished stream leaves nothing behind.
+function streamGuard(signal, idle = STREAM_IDLE_MS, hard = STREAM_HARD_MS) {
+  const controller = new AbortController()
+  // Node keeps a process alive for a pending timer; a guard must not.
+  const arm = (fn, ms) => {
+    const t = setTimeout(fn, ms)
+    if (typeof t?.unref === "function") t.unref()
+    return t
+  }
+  let idleTimer
+  const bump = () => {
+    clearTimeout(idleTimer)
+    idleTimer = arm(() => controller.abort(new Error("upstream stream idle timeout")), idle)
+  }
+  const hardTimer = arm(() => controller.abort(new Error("upstream stream exceeded its time limit")), hard)
+  const relay = () => controller.abort(signal.reason)
+  if (signal) {
+    if (signal.aborted) relay()
+    else signal.addEventListener("abort", relay, { once: true })
+  }
+  bump()
+  return {
+    signal: controller.signal,
+    bump,
+    // The caller's own cancellation is not a failure of the upstream: a request
+    // the agent abandoned must end quietly, not with a truncation error.
+    cancelled: () => signal?.aborted === true,
+    done() {
+      clearTimeout(idleTimer)
+      clearTimeout(hardTimer)
+      signal?.removeEventListener?.("abort", relay)
+    },
+  }
 }
 
 // ---- enterprise VPC (Qoder CN) --------------------------------------------------
@@ -721,10 +767,23 @@ function qoderBody(chat, m, site) {
   return body
 }
 
-// failure is the status and message for a Qoder failure: a refused sign-in
-// asks for another, a quota is a 429.
+// QUOTA and AUTH are the upstream's own words for "out of credits" and "this
+// sign-in is gone". Both are matched loosely on purpose: the gateway wraps one
+// condition in several shapes (a code, a message, Chinese text), and the cost
+// of a missed match is a failed request that could have moved to the next
+// account instead.
+const QUOTA = /quota[_ .-]*(?:exceed|exhaust)|insufficient[_ .-]*(?:quota|balance|credit)|credit[s]?[_ .-]*(?:exhaust|insufficient)|额度(?:已)?(?:用尽|耗尽|不足)|积分(?:已)?(?:耗尽|用完|不足)/i
+const AUTH = /invalid[_ .-]*(?:grant|token)|(?:refresh[_ .-]*token).*(?:invalid|expired|revoked)|unauthorized|signature invalid|登录.*(?:失效|过期)/i
+
+// failure is the status and message for an upstream failure: a refused sign-in
+// asks for another, a missing credit is a 429 so the gateway can move on, and
+// everything else keeps the status the upstream gave. A 403 that only says a
+// model is unavailable is not a lapsed sign-in, and answering it with "sign in
+// again" would send the user after the wrong problem.
 function failure(status, text) {
-  if (status < 400 || status > 599) status = 502
+  // A code that is not a number (the gateway also uses words like
+  // "INSUFFICIENT_CREDITS") cannot be a status: the words below decide instead.
+  if (!Number.isInteger(status) || status < 400 || status > 599) status = 502
   let msg = String(text ?? "").trim()
   try {
     const j = JSON.parse(text)
@@ -738,12 +797,15 @@ function failure(status, text) {
   // lapsed: only a refused refresh did (errorResponse says kept). Qoder's
   // own words go with it: a 401 right after signing in isn't a lapsed
   // sign-in, and its reason is what says what is (Yayoi_no_yume on X).
-  if (status === 401 || status === 403) {
-    const said = msg && msg !== STATUS_CODES[status] ? ` (upstream said ${status}: ${msg.slice(0, 300)})` : ""
+  if (status === 401 || (status === 403 && AUTH.test(msg))) {
+    const said = msg && msg !== STATUS_CODES[status] ? ` (upstream said ${status}: ${redact(msg).slice(0, 300)})` : ""
     return { status: 401, message: "the sign-in lapsed — sign in again" + said }
   }
-  if (status === 429 || msg.toLowerCase().includes("quota")) return { status: 429, message: "upstream refused request: " + msg }
-  return { status, message: msg }
+  // 402 is the gateway's "payment required": credits, not a lapsed sign-in.
+  // The gateway also reports an exhausted quota as an ordinary 200 envelope,
+  // which arrives here through the same path, so the words are matched too.
+  if (status === 402 || status === 429 || QUOTA.test(msg)) return { status: 429, message: redact("upstream refused request: " + msg) }
+  return { status, message: redact(msg) }
 }
 
 // errorResponse is a failure as OpenAI's API gives it. signIn is what it
@@ -755,16 +817,25 @@ function failure(status, text) {
 const redact = (value) => {
   let text = String(value ?? "").replace(/\s+/g, " ").trim()
   text = text
-    .replace(/\b(Bearer|COSY)[.\w-]*/gi, "$1 [redacted]")
+    // The token may follow a space ("Bearer abc") or a dot ("COSY.abc"); both
+    // shapes are one credential and neither may survive.
+    .replace(/\b(Bearer|COSY)[\s.]+[^\s"',}]+/gi, "$1 [redacted]")
     .replace(/\bey[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, "[redacted]")
     .replace(/\bsk-[A-Za-z0-9_-]{8,}\b/g, "[redacted]")
+    .replace(/\bory_rt_[A-Za-z0-9._~-]+/g, "[redacted refresh token]")
   return text.length > 300 ? text.slice(0, 300) + "…" : text
 }
 
 const errorResponse = ({ status, message, signIn = status === 401 ? "kept" : undefined }) =>
   new Response(JSON.stringify({ error: { message: redact(message), type: "upstream_error", code: status } }), {
     status,
-    headers: { "Content-Type": "application/json", ...(signIn ? { "X-Magpie-Sign-In": signIn } : {}) },
+    headers: {
+      "Content-Type": "application/json",
+      ...(signIn ? { "X-Magpie-Sign-In": signIn } : {}),
+      // The upstream does not say when to come back, and a 429 without one
+      // makes the gateway guess; a minute is the account's own cooldown unit.
+      ...(status === 429 ? { "Retry-After": "60" } : {}),
+    },
   })
 
 // ---- the reply ----------------------------------------------------------------
@@ -861,33 +932,59 @@ class Splitter {
   }
 }
 
-async function* sseLines(body) {
+// sseLines yields whole `data:` lines. state records what the transport did:
+// `truncated` says the stream broke in a way we can prove (a read error, or a
+// last line with no newline after it, which is half a frame). A clean EOF is
+// not proof of anything by itself, so it is left for the caller to judge.
+async function* sseLines(body, state, onByte) {
   const dec = new TextDecoder()
   let buf = ""
-  for await (const chunk of body) {
-    buf += dec.decode(chunk, { stream: true })
-    let n
-    while ((n = buf.indexOf("\n")) >= 0) {
-      yield buf.slice(0, n).trim()
-      buf = buf.slice(n + 1)
+  try {
+    for await (const chunk of body) {
+      // Any byte proves the upstream is alive; it is the idle guard's only input.
+      if (chunk?.length) onByte?.()
+      buf += dec.decode(chunk, { stream: true })
+      let n
+      while ((n = buf.indexOf("\n")) >= 0) {
+        yield buf.slice(0, n).trim()
+        buf = buf.slice(n + 1)
+      }
     }
+  } catch (error) {
+    // The connection went away mid-stream: the frames after this point are lost.
+    state.broke = error
+    state.truncated = true
+    return
   }
-  if (buf.trim()) yield buf.trim()
+  // A trailing line without its newline is a frame the upstream never finished
+  // writing. Parse it (it may still be complete JSON) but mark the stream.
+  if (buf.trim()) {
+    state.partial = buf.trim()
+    state.truncated = true
+    yield buf.trim()
+  }
 }
 
 // events turns Qoder's SSE into chat completion pieces: each data line's
 // envelope has a "body" that is an OpenAI chunk, whose content may hold
 // tool calls to lift out.
-async function* events(body) {
+async function* events(body, onByte, cancelled) {
   const a = new Splitter()
+  const state = { truncated: false, broke: null, partial: "" }
   let index = -1 // the tool call being given
-  let native = -1 // the native tool call being assembled
+  // Native tool calls are keyed by the upstream's own index: one stream may
+  // carry several at once and interleave their argument fragments (0, 1, 0,
+  // 1 ...), so a single "current" index would open the same call twice and
+  // lose its name. Each upstream index keeps a slot and an outgoing index.
+  const natives = new Map()
+  let done = false
+  let meaningful = false
   const flushed = function* () {
     for (const f of a.flush()) if (f.text) yield { text: f.text }
   }
   let usage
   let fr = ""
-  for await (const line of sseLines(body)) {
+  for await (const line of sseLines(body, state, onByte)) {
     if (!line.startsWith("data:")) continue
     const payload = line.slice(5).trim()
     let env
@@ -901,7 +998,10 @@ async function* events(body) {
       yield { error: failure(Number(env.statusCodeValue), inner || payload) }
       return
     }
-    if (inner.trim() === "[DONE]") break
+    if (inner.trim() === "[DONE]") {
+      done = true
+      break
+    }
     let chunk
     try {
       chunk = JSON.parse(inner)
@@ -909,23 +1009,51 @@ async function* events(body) {
       continue
     }
     const delta = chunk?.choices?.[0]?.delta ?? {}
-    if (delta.reasoning_content) yield { reasoning: delta.reasoning_content }
+    if (delta.reasoning_content) {
+      meaningful = true
+      yield { reasoning: delta.reasoning_content }
+    }
     if (typeof delta.content === "string")
       for (const f of a.feed(delta.content)) {
-        if (f.call) yield { tool: { index: ++index, id: "call_" + hexID(), name: f.call.name, args: f.call.args } }
-        else if (f.text) yield { text: f.text }
+        if (f.call) {
+          meaningful = true
+          yield { tool: { index: ++index, id: "call_" + hexID(), name: f.call.name, args: f.call.args } }
+        } else if (f.text) {
+          meaningful = true
+          yield { text: f.text }
+        }
       }
     // tool calls served the OpenAI way keep Qoder's id: a result answers it
     for (const tc of delta.tool_calls ?? []) {
       const i = Number(tc.index ?? 0)
-      if (i !== native) {
-        native = i
-        yield* flushed()
+      const fn = tc.function ?? {}
+      let slot = natives.get(i)
+      if (!slot) {
+        slot = { out: -1, id: "", name: "", args: "", announced: false }
+        natives.set(i, slot)
+      }
+      // id and name arrive whole and are repeated by later frames, so they are
+      // refinements; only arguments are deltas to append.
+      if (!slot.id && tc.id) slot.id = tc.id
+      if (typeof fn.name === "string" && fn.name) slot.name = fn.name
+      if (typeof fn.arguments === "string" && fn.arguments) slot.args += fn.arguments
+      if (!slot.announced) {
+        // A frame that carries only an id, or a bare index, cannot open a call:
+        // the client reads the name from the frame that announces it.
+        if (!slot.name) continue
+        slot.out = ++index
+        slot.announced = true
+        meaningful = true
         a.sawTool = true
-        yield { tool: { index: ++index, id: tc.id || "call_" + hexID(), name: tc.function?.name ?? "", args: tc.function?.arguments ?? "" } }
-      } else if (tc.function?.arguments) yield { args: { index, text: tc.function.arguments } }
+        yield* flushed()
+        yield { tool: { index: slot.out, id: slot.id || "call_" + hexID(), name: slot.name, args: slot.args } }
+        slot.args = ""
+      } else if (typeof fn.arguments === "string" && fn.arguments) {
+        meaningful = true
+        yield { args: { index: slot.out, text: fn.arguments } }
+      }
     }
-    fr = chunk?.choices?.[0]?.finish_reason || fr
+    if (chunk?.choices?.[0]?.finish_reason) fr = chunk.choices[0].finish_reason
     // the usage comes in a chunk of its own after the finish, with no
     // choices, as the built-in read it (qoder.go): every request was
     // counted as 0 tokens when the finish ended the reading
@@ -940,35 +1068,74 @@ async function* events(body) {
       }
   }
   yield* flushed()
+  // A reply is whole only when the upstream said so ([DONE] or a finish_reason).
+  // A stream that broke, or stopped mid-frame, with neither is a truncation:
+  // reporting it as a normal stop would hand the client half a tool_call's
+  // arguments with nothing to notice it by. A request the caller cancelled is
+  // neither: it ends with no event at all.
+  if (cancelled?.()) return
+  if (!done && !fr && state.truncated) {
+    const why = state.broke
+      ? `upstream stream broke: ${state.broke?.message ?? state.broke}`
+      : state.partial
+        ? "upstream stream ended mid-frame"
+        : "upstream stream ended early"
+    yield { error: { status: 502, message: why } }
+    return
+  }
+  if (!meaningful) {
+    yield { error: { status: 502, message: "upstream ended without an answer" } }
+    return
+  }
   yield { stop: a.sawTool ? "tool_calls" : fr === "length" ? "length" : "stop", usage }
 }
 
 // answer turns Qoder's reply into the chat completion OpenAI's API gives.
 // A failure before the answer keeps its status; one after it ends the
 // stream with an error.
-async function answer(res, chat) {
+async function answer(res, chat, guard) {
   const id = "chatcmpl-" + hexID()
   const created = Math.floor(Date.now() / 1000)
-  const it = events(res.body)
+  const it = events(res.body, guard?.bump, guard?.cancelled)
   const first = await it.next()
-  if (first.value?.error) return errorResponse(first.value.error)
-  if (first.done) return errorResponse({ status: 502, message: "upstream ended without an answer" })
+  if (first.value?.error) {
+    guard?.done()
+    return errorResponse(first.value.error)
+  }
+  if (first.done) {
+    guard?.done()
+    return errorResponse({ status: 502, message: "upstream ended without an answer" })
+  }
 
   if (!chat.stream) {
     const msg = { role: "assistant", content: "" }
     let reasoning = ""
     const calls = []
+    const byIndex = new Map()
     let stop = "stop"
     let usage
     for (let r = first; !r.done; r = await it.next()) {
       const e = r.value
-      if (e.error) return errorResponse(e.error)
+      if (e.error) {
+        guard?.done()
+        return errorResponse(e.error)
+      }
       if (e.text) msg.content += e.text
       if (e.reasoning) reasoning += e.reasoning
-      if (e.tool) calls.push({ id: e.tool.id, type: "function", function: { name: e.tool.name, arguments: e.tool.args } })
-      if (e.args) calls[calls.length - 1].function.arguments += e.args.text
+      if (e.tool) {
+        const call = { id: e.tool.id, type: "function", function: { name: e.tool.name, arguments: e.tool.args } }
+        calls.push(call)
+        byIndex.set(e.tool.index, call)
+      }
+      // Fragments belong to the call they name, not to whichever call was
+      // opened last: interleaved calls would otherwise swap their arguments.
+      if (e.args) {
+        const call = byIndex.get(e.args.index)
+        if (call) call.function.arguments += e.args.text
+      }
       if (e.stop) [stop, usage] = [e.stop, e.usage]
     }
+    guard?.done()
     if (reasoning) msg.reasoning_content = reasoning
     if (calls.length) msg.tool_calls = calls
     return Response.json({ id, object: "chat.completion", created, model: chat.model, choices: [{ index: 0, message: msg, finish_reason: stop }], ...(usage ? { usage } : {}) })
@@ -988,7 +1155,9 @@ async function answer(res, chat) {
         ctl.enqueue(chunk({ role: "assistant", content: "" }))
       }
       if (r.done) {
-        ctl.enqueue(enc.encode("data: [DONE]\n\n"))
+        guard?.done()
+        // A cancelled request has no reader left to take the closing frame.
+        if (!guard?.cancelled()) ctl.enqueue(enc.encode("data: [DONE]\n\n"))
         return ctl.close()
       }
       const e = r.value
@@ -998,11 +1167,17 @@ async function answer(res, chat) {
       else if (e.args) ctl.enqueue(chunk({ tool_calls: [{ index: e.args.index, function: { arguments: e.args.text } }] }))
       else if (e.stop) ctl.enqueue(chunk({}, e.stop, e.usage ? { usage: e.usage } : {}))
       else if (e.error) {
-        ctl.enqueue(enc.encode(`data: ${JSON.stringify({ error: { message: e.error.message, code: e.error.status } })}\n\n`))
+        // Already streaming: the failure ends as one error frame, and no [DONE]
+        // follows it. The text is redacted here too -- this path does not go
+        // through errorResponse, and would otherwise echo the upstream's words
+        // verbatim, credential and all.
+        guard?.done()
+        ctl.enqueue(enc.encode(`data: ${JSON.stringify({ error: { message: redact(e.error.message), code: e.error.status } })}\n\n`))
         ctl.close()
       }
     },
     cancel() {
+      guard?.done()
       it.return?.()
     },
   })
@@ -1332,14 +1507,39 @@ export const makePlugin = (site) => async ({ client }) => {
       "X-Model-Key": m.key,
       "X-Model-Source": m.source,
     }
+    // A stream is bounded by silence, not by total time: the guard aborts only
+    // when nothing arrives for a stretch, so a long reasoning turn that keeps
+    // producing bytes is never cut mid-reply.
+    const guard = streamGuard(init.signal)
     let res
     try {
-      res = await fetch(CHAT_URL, { method: "POST", headers, body: wire, signal: init.signal })
+      res = await fetch(CHAT_URL, { method: "POST", headers, body: wire, signal: guard.signal })
     } catch (e) {
+      guard.done()
+      // A request the caller abandoned is not an upstream failure: rethrow its
+      // own reason so the host sees a cancellation, not a 502.
+      if (guard.cancelled()) throw init.signal?.reason ?? e
       return errorResponse({ status: 502, message: e.message })
     }
-    if (!res.ok) return errorResponse(failure(res.status, (await res.text()).slice(0, 1 << 20)))
-    return answer(res, chat)
+    if (!res.ok) {
+      guard.done()
+      return errorResponse(failure(res.status, (await res.text()).slice(0, 1 << 20)))
+    }
+    // A JSON body on the chat endpoint is a refusal, not an empty reply: the
+    // gateway answers this way for a refused request (quota, rate, sign-in)
+    // and there is no stream to read. Its own code decides the status, so an
+    // exhausted quota still reaches magpie as a 429 it can fail over on.
+    if ((res.headers.get("content-type") ?? "").toLowerCase().includes("application/json")) {
+      const text = (await res.text()).slice(0, 1 << 20)
+      guard.done()
+      let value
+      try {
+        value = JSON.parse(text)
+      } catch {}
+      const code = Number(value?.code ?? value?.status ?? value?.statusCodeValue)
+      return errorResponse(failure(Number.isFinite(code) ? code : res.status, text))
+    }
+    return answer(res, chat, guard)
   }
 
   return {
@@ -1474,4 +1674,4 @@ export const QoderAuthPlugin = makePlugin(SITES.qoder)
 export const QoderCNAuthPlugin = makePlugin(SITES["qoder-cn"])
 
 // for tests
-export const _internal = { vpcInstance, vpcSite, parseUsage, gfmt, when, failure, modelInfo, qoderBody, SITES, decodeBody, events }
+export const _internal = { vpcInstance, vpcSite, parseUsage, gfmt, when, failure, modelInfo, qoderBody, SITES, decodeBody, events, streamGuard }

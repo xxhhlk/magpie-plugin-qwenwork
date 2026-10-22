@@ -207,6 +207,104 @@ try {
   assert.ok(!/Bearer\s+(?!\[redacted\])\S/.test(bodyText) && !bodyText.includes('COSY.') && !/ey[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]+\./.test(bodyText), 'no bearer, COSY or jwt leaks in the client-facing error')
   checks.push('Client-facing errors carry no token-shaped text')
 
+  // ---- stream integrity ------------------------------------------------------
+  // A reply is whole only when the upstream said so. A stream that stops
+  // without [DONE] or a finish_reason must not be reported as a normal stop:
+  // the client would take half a tool_call's arguments for a whole one.
+
+  // Stopped mid-frame: the last line has no newline after it.
+  agentReplies.push([
+    sse({ role: 'assistant', content: 'partial' }),
+    'data: {"body":"{\\"choices\\":',
+  ].join(''))
+  const halfFrame = await loader.fetch(values.API + '/chat/completions', { body: JSON.stringify(chat({ stream: true })) })
+  const halfText = await halfFrame.text()
+  assert.ok(!halfText.includes('[DONE]'), 'a stream that stopped mid-frame must not end with [DONE]')
+  assert.match(halfText, /"error"/, 'a stream that stopped mid-frame ends with an error frame')
+  assert.match(halfText, /mid-frame/, 'the error says why it ended')
+
+  // The transport itself broke after some content had arrived.
+  let sent = false
+  agentReplies.push(new Response(new ReadableStream({
+    pull(c) {
+      if (!sent) {
+        sent = true
+        c.enqueue(new TextEncoder().encode(sse({ role: 'assistant', content: 'partial' })))
+        return
+      }
+      c.error(new Error('simulated: connection reset'))
+    },
+  }), { status: 200, headers: { 'Content-Type': 'text/event-stream' } }))
+  const broke = await loader.fetch(values.API + '/chat/completions', { body: JSON.stringify(chat({ stream: true })) })
+  const brokeText = await broke.text()
+  assert.ok(!brokeText.includes('[DONE]'), 'a broken transport must not end with [DONE]')
+  assert.match(brokeText, /connection reset/, 'the cause is kept for the operator')
+  checks.push('A truncated stream is an error frame, never a silent [DONE]')
+
+  // Nothing at all came back: an empty answer is a failure, not an empty reply.
+  agentReplies.push('')
+  const empty = await loader.fetch(values.API + '/chat/completions', { body: JSON.stringify(chat()) })
+  assert.equal(empty.status, 502, 'an empty upstream is a 502, not a 200 with no content')
+  checks.push('An upstream that ends without an answer is a 502')
+
+  // Two tool calls interleaved (0, 1, 0, 1): each keeps its own slot, so the
+  // second fragment of 0 lands on 0 and no call is opened twice.
+  agentReplies.push([
+    sse({ role: 'assistant', tool_calls: [{ index: 0, id: 'call_a', type: 'function', function: { name: 'lookup', arguments: '{"q":' } }] }),
+    sse({ role: 'assistant', tool_calls: [{ index: 1, id: 'call_b', type: 'function', function: { name: 'read', arguments: '{"p":' } }] }),
+    sse({ role: 'assistant', tool_calls: [{ index: 0, function: { arguments: '"a"}' } }] }),
+    sse({ role: 'assistant', tool_calls: [{ index: 1, function: { arguments: '"b"}' } }] }),
+    sse({}, 'tool_calls'),
+    'data: {"body":"[DONE]"}\n\n',
+  ].join(''))
+  const parallel = await loader.fetch(values.API + '/chat/completions', { body: JSON.stringify(chat({ tools })) })
+  const parallelBody = await parallel.json()
+  assert.deepEqual(
+    parallelBody.choices[0].message.tool_calls.map(c => [c.id, c.function.name, c.function.arguments]),
+    [['call_a', 'lookup', '{"q":"a"}'], ['call_b', 'read', '{"p":"b"}']],
+    'interleaved calls keep their own identity and arguments',
+  )
+  checks.push('Interleaved tool calls are assembled per upstream index')
+
+  // A model that is merely unavailable is not a lapsed sign-in: answering 401
+  // would send the user to re-authorize for nothing.
+  agentReplies.push(new Response(JSON.stringify({ code: 403, message: 'Model is not available for this user' }), { status: 403 }))
+  const forbidden = await loader.fetch(values.API + '/chat/completions', { body: JSON.stringify(chat()) })
+  assert.equal(forbidden.status, 403, 'an unavailable model keeps its 403')
+  assert.notEqual(forbidden.headers.get('X-Magpie-Sign-In'), 'expired', 'the account is still signed in')
+  checks.push('A 403 that is not about the sign-in keeps its own status')
+
+  // An exhausted quota is a 429 even when the gateway answers HTTP 200 with a
+  // JSON body instead of a stream, so the gateway can move on to the next
+  // account instead of failing the turn.
+  agentReplies.push(Response.json({ code: 402, message: '积分不足，请充值' }))
+  const outOfCredit = await loader.fetch(values.API + '/chat/completions', { body: JSON.stringify(chat()) })
+  assert.equal(outOfCredit.status, 429, 'an exhausted quota is a 429')
+  assert.equal(outOfCredit.headers.get('retry-after'), '60')
+  checks.push('An exhausted quota becomes a 429 for the next account')
+
+  // An error raised after the stream started is redacted as well: that path
+  // does not go through errorResponse and used to echo the upstream verbatim.
+  agentReplies.push([
+    sse({ role: 'assistant', content: 'started' }),
+    `data: ${JSON.stringify({ statusCodeValue: 500, body: JSON.stringify({ message: 'boom: Authorization: Bearer COSY.abc.def' }) })}\n\n`,
+  ].join(''))
+  const midFail = await loader.fetch(values.API + '/chat/completions', { body: JSON.stringify(chat({ stream: true })) })
+  const midText = await midFail.text()
+  assert.ok(!midText.includes('COSY.abc.def'), 'the mid-stream error frame is redacted')
+  assert.ok(!midText.includes('[DONE]'), 'an error frame is not followed by [DONE]')
+  checks.push('A mid-stream error is redacted and ends without [DONE]')
+
+  // A request the agent abandons is a cancellation, not a truncated reply:
+  // it must not be reported to the host as an upstream failure.
+  const live = _internal.streamGuard(undefined, 10_000, 20_000)
+  assert.equal(live.cancelled(), false, 'a stream nobody cancelled is not cancelled')
+  live.done()
+  const gone = _internal.streamGuard(AbortSignal.abort(new Error('caller went away')), 10_000, 20_000)
+  assert.equal(gone.cancelled(), true, 'the caller\'s own abort is recognised')
+  gone.done()
+  checks.push('A cancelled request is not reported as a truncation')
+
   const dir = new URL('./', import.meta.url)
   const report = {
     status: 'passed', kind: 'mocked provider integration; no live QwenWork requests', checks,
